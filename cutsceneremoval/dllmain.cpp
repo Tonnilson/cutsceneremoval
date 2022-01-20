@@ -3,38 +3,86 @@
 #include <xorstr.hpp>
 #include "pluginsdk.h"
 #include "searchers.h"
+#include <iostream>
+#include <Detours/src/detours.h>
+
+bool SkipSettingAvailable = false;
+class UserOptions {
+public:
+	char pad[0x35181]; // This is a fixed offset, this could change in the future...
+	bool SkipCutscene;
+};
+
+uintptr_t* bSetting = NULL;
+UserOptions* bUserOptions;
+
+uintptr_t GetAddress(uintptr_t AddressOfCall, int index, int length)
+{
+	if (!AddressOfCall)
+		return 0;
+
+	long delta = *(long*)(AddressOfCall + index);
+	return (AddressOfCall + delta + length);
+}
+
+bool(__fastcall* oUiStateGamePlayCinema)(__int64 UiStateCinema, __int64 cinemaId);
+bool __fastcall hkUiStateGamePlayCinema(__int64 UiStateCinema, __int64 cinemaId) {
+	// Check if Skip Dungeon Cutscenes option is available in this client
+	if (SkipSettingAvailable) {
+		// Make sure the pointer is valid
+		if (*bSetting) {
+			if (!bUserOptions)
+				bUserOptions = *(UserOptions**)bSetting;
+
+			if (bUserOptions->SkipCutscene)
+				return 0;
+		}
+	}
+	else {
+		// Region does not have have option so just force skip all cutscenes regardless.
+		return 0;
+	}
+
+	return oUiStateGamePlayCinema(UiStateCinema, cinemaId);
+}
 
 void __cdecl oep_notify([[maybe_unused]] const Version client_version)
 {
 	if (const auto module = pe::get_module()) {
+		DetourTransactionBegin();
+		DetourUpdateThread(NtCurrentThread());
 		uintptr_t handle = module->handle();
 		const auto sections2 = module->segments();
 		const auto& s2 = std::find_if(sections2.begin(), sections2.end(), [](const IMAGE_SECTION_HEADER& x) {
 			return x.Characteristics & IMAGE_SCN_CNT_CODE;
 			});
 		const auto data = s2->as_bytes();
+		
+		// This function checks if scene belongs to a dungeon, if so check if Skip Dungeon Cutscenes is enabled
+		// I'm just getting the object pointer for the UserSettings from this
+		auto sCheckSkipSetting = std::search(data.begin(), data.end(), pattern_searcher(xorstr_("48 C7 45 C0 FE FF FF FF 48 89 58 08 48 89 70 10 48 89 78 20 4C 8B E2 4C 8B F9")));
+		if (sCheckSkipSetting != data.end()) {
+			SkipSettingAvailable = true;
+			bSetting = (uintptr_t*)GetAddress((uintptr_t)&sCheckSkipSetting[0] + 0x1A, 3, 7);
+		}
 
-		// This function can be found by searching for String refs for: UiStateCinema::PlayCinema()
-		// Go to the start of the function and change it to ret (0xC3)
-		// x86 UE3 clients will not work this way and you need to change one of the first jump equals (JE) to a jmp (0xEB) otherwise client crashes
-		auto sInitCinematicScene = std::search(data.begin(), data.end(), pattern_searcher(xorstr_("48 89 5C 24 60 48 89 5C 24 68 C7 44 24 70 00 00 80 3F C7 44 24 74 00 00 80 3F 48 C7 44 24 78 00 00 80 3F")));
+		// UiStateGame::playCinema
+		auto sInitCinematicScene = std::search(data.begin(), data.end(), pattern_searcher(xorstr_("48 33 C4 48 89 45 17 4C 8B E2 48 8B F1")));
 		uintptr_t aInitCinematicScene = NULL;
 		if (sInitCinematicScene != data.end()) {
-			aInitCinematicScene = (uintptr_t)&sInitCinematicScene[0] - 0x97;
-			BYTE retCode[] = { 0xC3, 0x90 };
-			DWORD oldProtect;
-			VirtualProtect((LPVOID)aInitCinematicScene, sizeof(retCode), PAGE_EXECUTE_READWRITE, &oldProtect);
-			memcpy((LPVOID)aInitCinematicScene, retCode, sizeof(retCode));
-			VirtualProtect((LPVOID)aInitCinematicScene, sizeof(retCode), oldProtect, &oldProtect);
-
+			aInitCinematicScene = (uintptr_t)&sInitCinematicScene[0] - 0x2F;
+			oUiStateGamePlayCinema = module->rva_to<std::remove_pointer_t<decltype(oUiStateGamePlayCinema)>>(aInitCinematicScene - handle);
+			DetourAttach(&(PVOID&)oUiStateGamePlayCinema, &hkUiStateGamePlayCinema);
 		}
+		DetourTransactionCommit();
 	}
 }
 
 BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID lpvReserved)
 {
-	if (fdwReason == DLL_PROCESS_ATTACH)
+	if (fdwReason == DLL_PROCESS_ATTACH) {
 		DisableThreadLibraryCalls(hInstance);
+	}
 
 	return TRUE;
 }
