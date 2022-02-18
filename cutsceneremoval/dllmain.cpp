@@ -6,16 +6,10 @@
 #include <iostream>
 #include <Detours/src/detours.h>
 
-bool SkipSettingAvailable = false;
-class UserOptions {
-public:
-	char pad[0x35181]; // This is a fixed offset, this could change in the future...
-	bool SkipCutscene;
-};
+// Offset to the user setting Skip Dungeon Cutscene
+int SkipCutscene = 0;
 
 uintptr_t* bSetting = NULL;
-UserOptions* bUserOptions;
-
 uintptr_t GetAddress(uintptr_t AddressOfCall, int index, int length)
 {
 	if (!AddressOfCall)
@@ -27,21 +21,14 @@ uintptr_t GetAddress(uintptr_t AddressOfCall, int index, int length)
 
 bool(__fastcall* oUiStateGamePlayCinema)(__int64 UiStateCinema, __int64 cinemaId);
 bool __fastcall hkUiStateGamePlayCinema(__int64 UiStateCinema, __int64 cinemaId) {
-	// Check if Skip Dungeon Cutscenes option is available in this client
-	if (SkipSettingAvailable) {
-		// Make sure the pointer is valid
-		if (*bSetting) {
-			if (!bUserOptions)
-				bUserOptions = *(UserOptions**)bSetting;
-
-			if (bUserOptions->SkipCutscene)
-				return 0;
-		}
+	// Check if the pointer for User Settings is available
+	if (*bSetting) {
+		// Is Skip Dungeon Cutscene enabled?
+		if (*reinterpret_cast<bool*>(*bSetting + SkipCutscene))
+			return 0;
 	}
-	else {
-		// Region does not have have option so just force skip all cutscenes regardless.
-		return 0;
-	}
+	else
+		return 0; // Pointer was null but we won't let that stop us
 
 	return oUiStateGamePlayCinema(UiStateCinema, cinemaId);
 }
@@ -57,13 +44,13 @@ void __cdecl oep_notify([[maybe_unused]] const Version client_version)
 			return x.Characteristics & IMAGE_SCN_CNT_CODE;
 			});
 		const auto data = s2->as_bytes();
-		
+
 		// This function checks if scene belongs to a dungeon, if so check if Skip Dungeon Cutscenes is enabled
 		// I'm just getting the object pointer for the UserSettings from this
 		auto sCheckSkipSetting = std::search(data.begin(), data.end(), pattern_searcher(xorstr_("48 C7 45 C0 FE FF FF FF 48 89 58 08 48 89 70 10 48 89 78 20 4C 8B E2 4C 8B F9")));
 		if (sCheckSkipSetting != data.end()) {
-			SkipSettingAvailable = true;
-			bSetting = (uintptr_t*)GetAddress((uintptr_t)&sCheckSkipSetting[0] + 0x1A, 3, 7);
+			memcpy(&SkipCutscene, &sCheckSkipSetting[0] + 0x23, 4); // Get the offset for Skip Dungeon Cutscene
+			bSetting = (uintptr_t*)GetAddress((uintptr_t)&sCheckSkipSetting[0] + 0x1A, 3, 7); // Get pointer to User Settings object
 		}
 
 		// UiStateGame::playCinema
